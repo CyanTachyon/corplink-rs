@@ -32,15 +32,16 @@ cd libwg
 ./build.sh
 # if you are using Windows, you can clone and build libwg maunally
 # ref: wireguard-go/Makefile:libwg
+cd ..
 
-cargo build --release
+cargo build --locked --release
 # install corplink-rs to your PATH
 mv target/release/corplink-rs /usr/bin/
 ```
 
 ### windows
 
-**前提**: 需要 Go (≥1.22)、GCC (MinGW-w64)、make、Rust (GNU 工具链)。
+**前提**: 需要 Go（CI 使用 1.26.10）、GCC (MinGW-w64)、make、Rust (GNU 工具链)。
 
 安装工具链后，在 **PowerShell** 中执行：
 
@@ -53,7 +54,7 @@ cd libwg
 cd ..
 rustup toolchain install stable-gnu
 rustup default stable-x86_64-pc-windows-gnu
-cargo build --release
+cargo build --locked --release
 ```
 
 > 编译的 `build.ps1` 会调用 `make libwg`，该目标会以 `CGO_ENABLED=1` 编译 Go 代码。
@@ -105,7 +106,7 @@ $env:RUST_LOG="debug"; .\corplink-rs.exe config.json
 
 `corplink-rs` 依赖 [Wintun][6] 虚拟网卡驱动来创建 WireGuard 隧道。由于 Wintun 的许可证要求用户从[官网][6]直接获取，我们无法在 release 包中附带该文件。
 
-`setup.ps1` 脚本会自动从 `wintun.net` 下载并解压 `amd64` 版本的 `wintun.dll` 到当前目录。
+`setup.ps1` 脚本会从 `wintun.net` 下载固定版本，并核对 ZIP 与 `amd64/wintun.dll` 的 SHA-256 后复制到脚本所在目录。已有 DLL 也必须匹配固定校验值；不匹配会停止，不自动覆盖。
 
 手动获取：访问 [wintun.net][6]，下载 zip 包，将 `bin/amd64/wintun.dll` 复制到 `corplink-rs.exe` 所在目录。
 
@@ -175,7 +176,10 @@ RUST_LOG=debug ./corplink-rs config.json
   "device_id": "md5 of device_name or any string with same format",
   "public_key": "wg public key, can be generated from private key",
   "private_key": "wg private key",
-  "server": "server link",
+  "server": "https://vpn.example.com",
+  // optional PEM CA bundle, trusted only by this application (not the OS).
+  // Leave unset for servers with publicly trusted certificates.
+  "ca_cert_file": null,
   // enable wg-go log to debug uapi problems
   "debug_wg": true,
   // will use corplink as interface name
@@ -187,9 +191,10 @@ RUST_LOG=debug ./corplink-rs config.json
   // latency: choose the server with the lowest latency
   // default: choose the first available server
   "vpn_select_strategy": "latency",
-  // use vpn dns (macOS: networksetup; Linux: rename /etc/resolv.conf aside
-  //   and write a new one with the VPN-provided nameserver)
-  // NOTE: if process doesn't exit gracefully, your dns may not be restored
+  // use vpn dns (macOS: networksetup; Linux: preserve /etc/resolv.conf
+  //   and atomically replace it with the VPN-provided nameserver).
+  // Recovery is journaled and retried at the next DNS-enabled TUN startup;
+  // settings changed externally are not overwritten during restoration.
   "use_vpn_dns": false,
   // optional: filename for the Linux backup of /etc/resolv.conf.
   // Default "resolv.conf.corplink", always placed next to /etc/resolv.conf.
@@ -230,9 +235,11 @@ RUST_LOG=debug ./corplink-rs config.json
   // proxy at this address instead of creating a kernel TUN device. No system
   // interface, routes, DNS changes or root privileges are required.
   // supports TCP CONNECT and UDP ASSOCIATE; hostnames are resolved in-tunnel.
-  "socks5_listen": "0.0.0.0:1080",
+  "socks5_listen": "127.0.0.1:1080",
   // optional: require SOCKS5 username/password auth (RFC 1929) on the proxy.
-  // when socks5_username is empty/unset, the proxy accepts connections with no auth.
+  // Both credentials must be nonempty, or both omitted on a loopback listener.
+  // A non-loopback listener always requires authentication.
+  // UDP ASSOCIATE clients must announce their bound UDP source port (not 0).
   "socks5_username": "user",
   "socks5_password": "pass",
   // optional: force the WireGuard transport ("udp" or "tcp") instead of the
@@ -259,7 +266,10 @@ RUST_LOG=debug ./corplink-rs config.json
 
 - **无需 root / 不改系统路由和 DNS / 不建网卡**，适合容器、无权限环境或只想给单个应用走 VPN 的场景
 - 支持 TCP `CONNECT` 和 UDP `ASSOCIATE`，域名在隧道内解析（用 `--socks5-hostname` 让客户端把 DNS 也交给代理）
-- 可选用户名/密码认证（RFC 1929）：设置 `socks5_username`（及 `socks5_password`）即开启；留空则免认证
+- 用户名/密码认证（RFC 1929）：用户名与密码必须同时非空；只有回环地址允许同时省略。监听地址必须是 IP 与端口，例如 `127.0.0.1:1080` 或 `[::1]:1080`。默认应仅监听回环地址。
+- UDP `ASSOCIATE` 必须先绑定本地 UDP socket，再在认证后的 TCP 请求中声明该 socket 的非零源端口；来源 IP 必须匹配 TCP 对端。请求端口 `0` 会被拒绝，因此部分通用 SOCKS 客户端的 UDP 功能不兼容；TCP `CONNECT` 不受此限制。
+- 服务同时限制最多 128 个客户端会话和 128 个目标连接；超过上限会拒绝新增连接，防止代理无限占用资源。
+- RFC 1929 本身不加密密码。即使启用认证，也不要将代理直接暴露在不可信网络上；本地其他用户也能访问免认证的回环监听。
 
 ```sh
 # 例：通过代理访问内网
@@ -267,6 +277,20 @@ curl --socks5-hostname user:pass@127.0.0.1:1080 https://intranet.example.com/
 ```
 
 此模式下 `interface_name`、`use_vpn_dns`、`auto_setup_routes` 等与系统网卡/路由相关的设置不生效。
+
+# 安全配置与升级说明
+
+- 所有发现、登录、网关 API 请求都要求 HTTPS，并验证证书链和主机名；不跟随重定向，避免认证头被转发到其他来源。私有 CA 部署可配置 `ca_cert_file`（PEM 文件）；相对路径以进程当前目录为准，建议使用绝对路径。该选项仅为本进程增加信任，不安装系统根证书，也不会关闭主机名验证。若网关宣告 IP、证书却仅含 DNS 名称，将拒绝连接；需要修正服务端证书或网关配置。应从管理员通过可信渠道获取并核对 CA，不要为了连通而信任未知证书。
+- Unix 下配置及 Cookie 文件以 `0600` 原子保存，新建私有目录使用 `0700`。拒绝符号链接、多硬链接、其他用户拥有的文件，以及其他用户可写的父目录。以 root 运行时，配置必须置于 root 拥有的目录（例如 `/etc/corplink`），不能继续从普通用户的家目录读写秘密；不会自动更改用户目录权限。旧的普通文件权限会在安全检查后迁移为 `0600`。Windows 应自行为配置目录设置仅本人及管理员可读写的 ACL；程序不宣称 Unix mode 位能保护 Windows 文件。
+- 密码、Cookie、OTP 种子和 VPN 私钥仍需要在本地使用，文件权限保护并非静态加密。程序不再记录这些秘密或完整 API 响应；TPS 登录链接仅显示在交互终端，无法访问终端时不会将票据写入服务日志。曾由旧版输出的日志和已泄露凭据不因升级自动失效，应单独清理和撤销。
+- `use_vpn_dns` 仍默认关闭。macOS 使用 `/var/db/corplink-rs/dns.json` 持久保存恢复信息，并跳过停用的网络服务；Linux 使用 `/etc/<dns_backup_filename>` 及相邻 `.state` 文件。下次启用 DNS 的 TUN 启动会先恢复未完成操作，恢复失败则拒绝继续。若某个曾修改的服务后来被停用或移除，会保留待恢复记录而不触碰该服务；重新启用后可再次恢复。不要删除待恢复日志/备份。恢复仅改回仍等于本程序设置值的配置，保留用户或其他程序的后续修改。强制结束进程后不会有后台服务自动恢复 DNS，需要再次运行客户端。
+- TCP 模式客户端只主动连接 VPN 网关，不再开放入站 WireGuard TCP 监听；同一连接上的双向通信保留。
+
+## 构建与发行验证
+
+CI 的 Go/Rust 工具链使用固定版本，Actions 使用提交 SHA，Rust 构建使用 `--locked`。Arch Linux 依然使用发行版的工具链；`pack/PKGBUILD` 固定两个源码归档及 SHA-256，发布新版本前必须同时更新版本、Go gitlink 和校验值。CI 会拒绝以新标签发布旧配方，或发布与 gitlink 不同的 Go 源码。
+
+发行工作流会生成 `SHA256SUMS` 和 GitHub 构建来源证明，且不覆盖已有同名资产。只有包含这些工作流更改后新生成的发行版才具备它们；这不能追溯证明旧发行版的二进制与源码一致。可用 `gh attestation verify <下载的资产> --repo PinkD/corplink-rs` 验证来源，并核对版本与提交。构建来源证明不等同于 Apple Developer ID 签名或公证，也不保证程序没有漏洞。
 
 # 原理和分析
 

@@ -1,7 +1,6 @@
+use bindgen::callbacks::{IntKind, ParseCallbacks};
 use std::env;
 use std::path::PathBuf;
-use bindgen::callbacks::{IntKind, ParseCallbacks};
-
 
 #[derive(Debug)]
 struct DefineParser;
@@ -21,10 +20,12 @@ fn main() {
     println!("cargo:rustc-link-search=./libwg");
 
     // Tell cargo to tell rustc to link the shared library.
-    println!("cargo:rustc-link-lib=wg");
+    println!("cargo:rustc-link-lib=static=wg");
 
     // Tell cargo to invalidate the built crate whenever the wrapper changes
     println!("cargo:rerun-if-changed=./libwg/libwg.h");
+    // A Go security update need not change the C ABI/header. Relink it anyway.
+    println!("cargo:rerun-if-changed=./libwg/libwg.a");
 
     // The bindgen::Builder is the main entry point
     // to bindgen, and lets you build up options for
@@ -35,13 +36,9 @@ fn main() {
         .header("./libwg/libwg.h")
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
-        .parse_callbacks(Box::new(
-            bindgen::CargoCallbacks,
-        ))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
         // parse number define macro as i32 instead of u32
-        .parse_callbacks(Box::new(
-            DefineParser,
-        ))
+        .parse_callbacks(Box::new(DefineParser))
         // Finish the builder and generate the bindings.
         .generate()
         // Unwrap the Result and panic on failure.

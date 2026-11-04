@@ -4,9 +4,11 @@ mod config;
 mod dns;
 mod qrcode;
 mod resp;
+mod secure_file;
 mod state;
 mod template;
 mod totp;
+mod transport;
 mod utils;
 mod wg;
 
@@ -61,13 +63,18 @@ pub const ETIMEDOUT: i32 = 110;
 
 #[tokio::main]
 async fn main() {
-    if let Err(err) = run().await {
-        log::error!("{:#}", err);
-        exit(EPERM);
-    }
+    let code = match run().await {
+        Ok(code) => code,
+        Err(err) => {
+            log::error!("{:#}", err);
+            EPERM
+        }
+    };
+    // run() has completed cleanup and dropped its locks before process exit.
+    exit(code);
 }
 
-async fn run() -> Result<()> {
+async fn run() -> Result<i32> {
     // NOTE: If you want to debug, you should set `RUST_LOG` env to `debug` and run corplink-rs in root
     //  because `check_privilege` will call sudo and drop env if you're not root
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -86,6 +93,10 @@ async fn run() -> Result<()> {
     let socks5_username = conf.socks5_username.clone().unwrap_or_default();
     let socks5_password = conf.socks5_password.clone().unwrap_or_default();
     let netstack_mode = socks5_listen.is_some();
+    if let Some(listen) = &socks5_listen {
+        wg::validate_socks_config(listen, &socks5_username, &socks5_password)
+            .context("invalid SOCKS configuration")?;
+    }
 
     // netstack/socks5 mode runs entirely in userspace (no kernel TUN device,
     // no system routes/dns), so it does not require elevated privileges.
@@ -97,6 +108,17 @@ async fn run() -> Result<()> {
     let use_vpn_dns = conf.use_vpn_dns.unwrap_or(false);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let dns_backup_filename = conf.dns_backup_filename.clone();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let mut dns_manager = if use_vpn_dns && !netstack_mode {
+        let mut manager = DNSManager::new(dns_backup_filename)?;
+        // Repair an interrupted previous session before any network login.
+        manager
+            .recover_dns()
+            .context("failed to recover previous DNS settings")?;
+        Some(manager)
+    } else {
+        None
+    };
 
     if conf.server.is_none() {
         let resp = client::get_company_url(conf.company_name.as_str())
@@ -150,91 +172,88 @@ async fn run() -> Result<()> {
         };
     }
     let wg_conf = wg_conf.ok_or_else(|| anyhow!("wg conf missing after connect loop"))?;
-    let protocol = wg_conf.protocol;
     let mut uapi = wg::UAPIClient { name: name.clone() };
-    if let Some(listen) = &socks5_listen {
-        log::info!("start wg-corplink (netstack/socks5) on {}", listen);
-        wg::start_wg_go_netstack(&wg_conf, listen, &socks5_username, &socks5_password, with_wg_log)
+    let mut wg_attempted = false;
+    // Capture setup failures as well as normal termination, so every successful
+    // server connection reaches the same local cleanup and disconnect path.
+    let session_result: Result<i32> = async {
+        wg::build_uapi_config(&wg_conf, netstack_mode)
+            .context("invalid WireGuard configuration")?;
+        wg_attempted = true;
+        if let Some(listen) = &socks5_listen {
+            wg::start_wg_go_netstack(
+                &wg_conf,
+                listen,
+                &socks5_username,
+                &socks5_password,
+                with_wg_log,
+            )
             .context("failed to start wg-corplink in netstack mode")?;
-        uapi.config_wg_netstack(&wg_conf)
-            .await
-            .context("failed to config netstack interface with uapi")?;
-        if socks5_username.is_empty() {
-            log::info!("socks5 proxy ready at {} (no auth)", listen);
-        } else {
+            uapi.config_wg_netstack(&wg_conf)
+                .await
+                .context("failed to configure netstack")?;
             log::info!(
-                "socks5 proxy ready at {} (username/password auth required)",
-                listen
+                "SOCKS proxy ready at {} ({})",
+                listen,
+                if socks5_username.is_empty() {
+                    "loopback, no authentication"
+                } else {
+                    "username/password required"
+                }
             );
+        } else {
+            wg::start_wg_go(&name, wg_conf.protocol, with_wg_log)
+                .context("failed to start wg-corplink")?;
+            uapi.config_wg(&wg_conf)
+                .await
+                .context("failed to configure interface")?;
         }
-    } else {
-        log::info!("start wg-corplink for {}", &name);
-        wg::start_wg_go(&name, protocol, with_wg_log)
-            .with_context(|| format!("failed to start wg-corplink for {}", name))?;
-        uapi.config_wg(&wg_conf)
-            .await
-            .with_context(|| format!("failed to config interface with uapi for {name}"))?;
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let mut dns_manager = DNSManager::new(dns_backup_filename);
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if use_vpn_dns && !netstack_mode {
-        match dns_manager.set_dns(vec![&wg_conf.dns], vec![]) {
-            Ok(_) => {}
-            Err(err) => {
-                log::warn!("failed to set dns: {}", err);
-            }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(manager) = dns_manager.as_mut() {
+            let servers = wg_conf.dns.split(',').filter(|s| !s.is_empty()).collect();
+            manager
+                .set_dns(servers, vec![])
+                .context("failed to set VPN DNS")?;
+        }
+        tokio::select! {
+            _ = wait_for_shutdown_signal() => Ok(0),
+            _ = uapi.check_wg_connection() => {
+                log::warn!("last handshake timeout");
+                Ok(ETIMEDOUT)
+            },
         }
     }
+    .await;
 
-    let mut exit_code = 0;
-    tokio::select! {
-        _ = wait_for_shutdown_signal() => {},
-
-        // keep alive
-        // _ = c.keep_alive_vpn(&wg_conf, 60) => {
-        //     exit_code = ETIMEDOUT;
-        // },
-
-        // check wg handshake and exit if timeout
-        _ = async {
-            uapi.check_wg_connection().await;
-            log::warn!("last handshake timeout");
-        } => {
-            exit_code = ETIMEDOUT;
-        },
-    }
-
-    // shutdown
-    log::info!("disconnecting vpn...");
-    if let Err(e) = c.disconnect_vpn(&wg_conf).await {
-        log::warn!("failed to disconnect vpn: {}", e)
+    // Restore local networking before remote requests, which can fail or time
+    // out. A failed restore retains durable recovery state and is reported.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let dns_result = match dns_manager.as_mut() {
+        Some(manager) => manager
+            .restore_dns()
+            .context("failed to restore DNS; recovery state retained"),
+        None => Ok(()),
     };
-
-    // only logout for feilian_v1
-    if platform.as_deref() == Some(config::PLATFORM_CORPLINK_V1) {
-        log::info!("logging out current terminal...");
-        if let Err(e) = c.logout().await {
-            log::warn!("failed to logout: {}", e)
-        };
+    if wg_attempted {
+        wg::stop_wg_go();
     }
-
-    wg::stop_wg_go();
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if use_vpn_dns && !netstack_mode {
-        match dns_manager.restore_dns() {
-            Ok(_) => {}
-            Err(err) => {
-                log::warn!("failed to delete dns: {}", err);
-            }
+    log::info!("disconnecting VPN...");
+    if let Err(error) = c.disconnect_vpn(&wg_conf).await {
+        log::warn!("failed to disconnect VPN: {}", error);
+    }
+    if platform.as_deref() == Some(config::PLATFORM_CORPLINK_V1) {
+        if let Err(error) = c.logout().await {
+            log::warn!("failed to logout: {}", error);
         }
     }
-
-    log::info!("reach exit");
-    exit(exit_code)
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Err(error) = dns_result {
+        if let Err(session_error) = &session_result {
+            log::error!("VPN session failed: {session_error:#}");
+        }
+        return Err(error);
+    }
+    session_result
 }
 
 // Resolve when the process is asked to terminate: ctrl+c (SIGINT) or, on unix,

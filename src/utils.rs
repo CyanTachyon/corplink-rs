@@ -5,8 +5,8 @@ use anyhow::{anyhow, Context, Result};
 
 use aes::Aes256;
 use base32::Alphabet;
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as base64;
+use base64::Engine;
 use cbc::cipher::{block_padding::Pkcs7, generic_array::GenericArray, BlockEncryptMut, KeyIvInit};
 use rand::rngs::OsRng;
 use sha1::{Digest, Sha1};
@@ -22,8 +22,7 @@ pub async fn read_line() -> Result<String> {
 }
 
 pub fn b32_decode(s: &str) -> Result<Vec<u8>> {
-    base32::decode(Alphabet::RFC4648 { padding: true }, s)
-        .context("failed to decode base32")
+    base32::decode(Alphabet::RFC4648 { padding: true }, s).context("failed to decode base32")
 }
 
 pub fn gen_wg_keypair() -> (String, String) {
@@ -36,7 +35,7 @@ pub fn gen_wg_keypair() -> (String, String) {
 pub fn gen_public_key_from_private(private_key: &String) -> Result<String> {
     let key = base64
         .decode(private_key)
-        .with_context(|| format!("failed to base64 decode private key {private_key}"))?;
+        .context("failed to base64 decode private key")?;
     let key: [u8; 32] = key
         .try_into()
         .map_err(|_| anyhow!("private key has invalid length"))?;
@@ -45,10 +44,69 @@ pub fn gen_public_key_from_private(private_key: &String) -> Result<String> {
     Ok(base64.encode(public_key.to_bytes()))
 }
 
+/// Validate server-assigned addresses before they can reach WireGuard UAPI or a
+/// platform network command. Parsing also rejects CR/LF and embedded CIDRs.
+pub(crate) fn validated_interface_addresses(
+    ip: &str,
+    ipv6: &str,
+    mask: &str,
+) -> Result<(String, String)> {
+    let ip = ip
+        .parse::<std::net::Ipv4Addr>()
+        .context("invalid assigned IPv4 address")?;
+    if mask.is_empty() || !mask.bytes().all(|b| b.is_ascii_digit()) {
+        anyhow::bail!("invalid assigned IPv4 prefix");
+    }
+    let prefix = mask.parse::<u8>().context("invalid assigned IPv4 prefix")?;
+    if prefix > 32 {
+        anyhow::bail!("assigned IPv4 prefix exceeds 32");
+    }
+    let address6 = if ipv6.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{}/128",
+            ipv6.parse::<std::net::Ipv6Addr>()
+                .context("invalid assigned IPv6 address")?
+        )
+    };
+    Ok((format!("{ip}/{prefix}"), address6))
+}
+
+/// Login tickets are intentionally shown to an interactive user, never a log
+/// sink. A service without a controlling terminal must use another login method.
+pub(crate) fn show_auth_link(value: &str) -> Result<()> {
+    use std::io::Write;
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("invalid authentication link");
+    }
+    let url = reqwest::Url::parse(value).context("invalid authentication link")?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        anyhow::bail!("authentication link must use HTTPS without URL credentials");
+    }
+    #[cfg(unix)]
+    let terminal = "/dev/tty";
+    #[cfg(windows)]
+    let terminal = "CONOUT$";
+    let mut terminal = std::fs::OpenOptions::new()
+        .write(true)
+        .open(terminal)
+        .context(
+            "third-party login requires an interactive terminal to display its private link",
+        )?;
+    writeln!(
+        terminal,
+        "Open this private authentication link in your browser:\n{url}"
+    )?;
+    Ok(())
+}
+
 pub fn b64_decode_to_hex(s: &str) -> Result<String> {
-    let data = base64
-        .decode(s)
-        .with_context(|| format!("failed to base64 decode string {s}"))?;
+    let data = base64.decode(s).context("failed to base64 decode key")?;
     let mut hex = String::new();
     for c in data {
         hex.push_str(format!("{c:02x}").as_str());
@@ -90,14 +148,10 @@ pub fn intersect_cidr_with_cidr(first: &str, second: &str) -> Option<String> {
     if !same_family(first_base, second_base) {
         return None;
     }
-    if first_prefix >= second_prefix
-        && cidr_contains_ip(second_base, second_prefix, first_base)
-    {
+    if first_prefix >= second_prefix && cidr_contains_ip(second_base, second_prefix, first_base) {
         return Some(format!("{first_base}/{first_prefix}"));
     }
-    if second_prefix >= first_prefix
-        && cidr_contains_ip(first_base, first_prefix, second_base)
-    {
+    if second_prefix >= first_prefix && cidr_contains_ip(first_base, first_prefix, second_base) {
         return Some(format!("{second_base}/{second_prefix}"));
     }
     None
@@ -161,9 +215,7 @@ pub fn subtract_cidr_from_cidr(outer: &str, inner: &str) -> Vec<String> {
         return vec![outer.to_string()];
     }
     // inner covers outer (inner prefix is shorter or equal and contains outer's base)
-    if inner_prefix <= outer_prefix
-        && cidr_contains_ip(inner_base, inner_prefix, outer_base)
-    {
+    if inner_prefix <= outer_prefix && cidr_contains_ip(inner_base, inner_prefix, outer_base) {
         return Vec::new();
     }
     // outer doesn't contain inner → disjoint
@@ -172,7 +224,13 @@ pub fn subtract_cidr_from_cidr(outer: &str, inner: &str) -> Vec<String> {
     }
     // outer strictly contains inner, carve by recursive bisection
     let host_bits = host_bit_count(outer_base);
-    carve_recursive(outer_base, outer_prefix, host_bits, inner_base, inner_prefix)
+    carve_recursive(
+        outer_base,
+        outer_prefix,
+        host_bits,
+        inner_base,
+        inner_prefix,
+    )
 }
 
 fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
@@ -200,11 +258,19 @@ fn same_family(a: IpAddr, b: IpAddr) -> bool {
 }
 
 fn mask_v4(prefix: u8) -> u32 {
-    if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) }
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
 }
 
 fn mask_v6(prefix: u8) -> u128 {
-    if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) }
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
 }
 
 fn canonicalize(ip: IpAddr, prefix: u8) -> IpAddr {
@@ -233,12 +299,18 @@ fn split_half(base: IpAddr, prefix: u8) -> (IpAddr, IpAddr) {
         IpAddr::V4(b) => {
             let bu = u32::from(b);
             let bit = 1u32 << (31 - prefix);
-            (IpAddr::V4(Ipv4Addr::from(bu)), IpAddr::V4(Ipv4Addr::from(bu | bit)))
+            (
+                IpAddr::V4(Ipv4Addr::from(bu)),
+                IpAddr::V4(Ipv4Addr::from(bu | bit)),
+            )
         }
         IpAddr::V6(b) => {
             let bu = u128::from(b);
             let bit = 1u128 << (127 - prefix);
-            (IpAddr::V6(Ipv6Addr::from(bu)), IpAddr::V6(Ipv6Addr::from(bu | bit)))
+            (
+                IpAddr::V6(Ipv6Addr::from(bu)),
+                IpAddr::V6(Ipv6Addr::from(bu | bit)),
+            )
         }
     }
 }
@@ -289,11 +361,19 @@ mod tests {
         let prefix: u8 = prefix_s.parse().expect("bad prefix in test helper");
         match (base, addr) {
             (IpAddr::V4(b), IpAddr::V4(a)) => {
-                let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
                 (u32::from(b) & mask) == (u32::from(a) & mask)
             }
             (IpAddr::V6(b), IpAddr::V6(a)) => {
-                let mask = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
                 (u128::from(b) & mask) == (u128::from(a) & mask)
             }
             _ => false,
@@ -444,7 +524,11 @@ mod tests {
         assert_eq!(out.len(), 32);
         let host: IpAddr = "1.2.3.4".parse().unwrap();
         for cidr in &out {
-            assert!(!cidr_contains_addr(cidr, host), "{} should not cover 1.2.3.4", cidr);
+            assert!(
+                !cidr_contains_addr(cidr, host),
+                "{} should not cover 1.2.3.4",
+                cidr
+            );
         }
     }
 
@@ -488,5 +572,33 @@ mod tests {
         let out = sorted(subtract_cidr_from_cidr("10.0.0.0/16", "10.0.5.7/24"));
         let expected = sorted(subtract_cidr_from_cidr("10.0.0.0/16", "10.0.5.0/24"));
         assert_eq!(out, expected);
+    }
+    #[test]
+    fn assigned_addresses_reject_uapi_injection_and_wrong_family() {
+        assert_eq!(
+            super::validated_interface_addresses("192.0.2.3", "2001:0db8::1", "24").unwrap(),
+            ("192.0.2.3/24".into(), "2001:db8::1/128".into())
+        );
+        for (ip, ipv6, mask) in [
+            ("192.0.2.3\nprivate_key=attacker", "", "24"),
+            ("192.0.2.3", "::1\nreplace_peers=true", "24"),
+            ("192.0.2.3", "192.0.2.4", "24"),
+            ("::1", "", "24"),
+            ("192.0.2.3", "", "33"),
+            ("192.0.2.3", "", "24\n"),
+        ] {
+            assert!(super::validated_interface_addresses(ip, ipv6, mask).is_err());
+        }
+    }
+
+    #[test]
+    fn private_key_errors_do_not_echo_input() {
+        let value = "private-key-marker-with-invalid-base64!".to_owned();
+        assert!(!format!(
+            "{:#}",
+            super::gen_public_key_from_private(&value).unwrap_err()
+        )
+        .contains(&value));
+        assert!(!format!("{:#}", super::b64_decode_to_hex(&value).unwrap_err()).contains(&value));
     }
 }
