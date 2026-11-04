@@ -2228,7 +2228,9 @@ mod tests {
                     .accept(stream)
                     .await
                     .unwrap();
-                crate::transport::tests::read_http_request(&mut stream).await;
+                crate::transport::tests::read_http_request(&mut stream)
+                    .await
+                    .expect("authenticated fixture request must be complete");
                 let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nSet-Cookie: fixture={SECRET}; Path=/\r\nConnection: close\r\n\r\n{body}", body.len());
                 stream.write_all(response.as_bytes()).await.unwrap();
             }

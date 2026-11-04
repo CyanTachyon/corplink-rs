@@ -286,6 +286,16 @@ curl --socks5-hostname user:pass@127.0.0.1:1080 https://intranet.example.com/
 - `use_vpn_dns` 仍默认关闭。macOS 使用 `/var/db/corplink-rs/dns.json` 持久保存恢复信息，并跳过停用的网络服务；Linux 使用 `/etc/<dns_backup_filename>` 及相邻 `.state` 文件。下次启用 DNS 的 TUN 启动会先恢复未完成操作，恢复失败则拒绝继续。若某个曾修改的服务后来被停用或移除，会保留待恢复记录而不触碰该服务；重新启用后可再次恢复。不要删除待恢复日志/备份。恢复仅改回仍等于本程序设置值的配置，保留用户或其他程序的后续修改。强制结束进程后不会有后台服务自动恢复 DNS，需要再次运行客户端。
 - TCP 模式客户端只主动连接 VPN 网关，不再开放入站 WireGuard TCP 监听；同一连接上的双向通信保留。
 
+Unix 的 TUN 模式应先将配置放入受保护的应用目录，并显式以 root 运行（读取配置发生在自动提权之前）：
+
+```sh
+sudo install -d -m 700 /etc/corplink
+sudo install -m 600 config.json /etc/corplink/config.json
+sudo corplink-rs /etc/corplink/config.json
+```
+
+SOCKS/netstack 模式仍可使用本人拥有的私有配置目录，以普通用户运行。
+
 ## 构建与发行验证
 
 CI 的 Go/Rust 工具链使用固定版本，Actions 使用提交 SHA，Rust 构建使用 `--locked`。Arch Linux 依然使用发行版的工具链；`pack/PKGBUILD` 固定两个源码归档及 SHA-256，发布新版本前必须同时更新版本、Go gitlink 和校验值。CI 会拒绝以新标签发布旧配方，或发布与 gitlink 不同的 Go 源码。

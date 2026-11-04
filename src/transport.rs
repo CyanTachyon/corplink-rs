@@ -87,26 +87,48 @@ pub(crate) mod tests {
 
     // Fixtures answer only after receiving the complete request. A TLS read may
     // contain only part of a header/body; closing early can otherwise cause RST.
-    pub async fn read_http_request<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
+    pub async fn read_http_request<S: tokio::io::AsyncRead + Unpin>(
+        stream: &mut S,
+    ) -> std::io::Result<Vec<u8>> {
+        use std::io::{Error, ErrorKind};
         let mut request = Vec::new();
         let mut buffer = [0_u8; 1024];
         loop {
-            let count = stream.read(&mut buffer).await.unwrap();
-            assert_ne!(count, 0, "fixture request closed before completion");
+            let count = stream.read(&mut buffer).await?;
+            if count == 0 {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "fixture request closed before completion",
+                ));
+            }
             request.extend_from_slice(&buffer[..count]);
-            assert!(request.len() <= 64 * 1024, "fixture request exceeded limit");
+            if request.len() > 64 * 1024 {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "fixture request exceeded limit",
+                ));
+            }
             if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                let headers = std::str::from_utf8(&request[..end]).unwrap();
+                let headers = std::str::from_utf8(&request[..end])
+                    .map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
                 let body_length = headers
                     .lines()
                     .find_map(|line| {
                         let (name, value) = line.split_once(':')?;
                         name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
+                            .then(|| value.trim().parse::<usize>())
                     })
+                    .transpose()
+                    .map_err(|error| Error::new(ErrorKind::InvalidData, error))?
                     .unwrap_or(0);
-                if request.len() >= end + 4 + body_length {
-                    return request;
+                let total = (end + 4)
+                    .checked_add(body_length)
+                    .filter(|length| *length <= 64 * 1024)
+                    .ok_or_else(|| {
+                        Error::new(ErrorKind::InvalidData, "fixture request exceeded limit")
+                    })?;
+                if request.len() >= total {
+                    return Ok(request);
                 }
             }
         }
@@ -119,8 +141,42 @@ pub(crate) mod tests {
         let sending = tokio::spawn(async move {
             writer.write_all(request).await.unwrap();
         });
-        assert_eq!(read_http_request(&mut reader).await, request);
+        assert_eq!(read_http_request(&mut reader).await.unwrap(), request);
         sending.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_fixture_returns_connection_abort_and_truncated_body_errors() {
+        struct AbortedRead;
+        impl tokio::io::AsyncRead for AbortedRead {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "simulated client certificate rejection",
+                )))
+            }
+        }
+        assert_eq!(
+            read_http_request(&mut AbortedRead)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer
+            .write_all(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nab")
+            .await
+            .unwrap();
+        drop(writer);
+        assert_eq!(
+            read_http_request(&mut reader).await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 
     pub fn tls_fixture() -> &'static (String, TlsAcceptor) {
@@ -181,17 +237,38 @@ pub(crate) mod tests {
         );
         let acceptor = tls_fixture().1.clone();
         let server = tokio::spawn(async move {
-            for _ in 0..3 {
+            // The client sends rejected-CA, trusted-CA, then wrong-hostname
+            // requests in order. Schannel can reject the certificate only after
+            // the server's TLS accept succeeds, surfacing as a request-read error.
+            for request_index in 0..3 {
                 let (stream, _) = listener.accept().await.unwrap();
-                if let Ok(mut stream) = acceptor.accept(stream).await {
-                    read_http_request(&mut stream).await;
-                    stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                        )
-                        .await
-                        .unwrap();
+                let mut stream = match acceptor.accept(stream).await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        assert_ne!(
+                            request_index, 1,
+                            "trusted client's TLS handshake failed: {error}"
+                        );
+                        continue;
+                    }
+                };
+                if let Err(error) = read_http_request(&mut stream).await {
+                    assert_ne!(
+                        request_index, 1,
+                        "trusted client's HTTP request failed: {error}"
+                    );
+                    continue;
                 }
+                assert_eq!(
+                    request_index, 1,
+                    "client sent HTTP despite an untrusted certificate or hostname"
+                );
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
             }
         });
         let untrusted = client_builder(None).unwrap().no_proxy().build().unwrap();
