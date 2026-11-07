@@ -1,5 +1,4 @@
 use std::fmt;
-use tokio::fs;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -129,17 +128,23 @@ impl fmt::Display for Config {
 
 impl Config {
     pub async fn from_file(file: &str) -> Result<Config> {
-        let conf_str = fs::read_to_string(file)
-            .await
+        let conf_str = crate::secure_file::read(std::path::Path::new(file))
             .with_context(|| format!("failed to read config file {file}"))?;
 
-        let mut conf: Config = serde_json::from_str(&conf_str[..])
+        let mut conf: Config = serde_json::from_slice(&conf_str)
             .map_err(|_| anyhow::anyhow!("failed to parse config file {file}"))?;
 
         if let Some(server) = &conf.server {
             crate::transport::validate_server_url(server)?;
         }
         conf.conf_file = Some(file.to_string());
+        #[cfg(unix)]
+        let mut update_conf = {
+            use std::os::unix::fs::PermissionsExt;
+            // Migrate legacy readable files via the same checked atomic writer.
+            std::fs::symlink_metadata(file)?.permissions().mode() & 0o777 != 0o600
+        };
+        #[cfg(not(unix))]
         let mut update_conf = false;
         if conf.interface_name.is_none() {
             conf.interface_name = Some(DEFAULT_INTERFACE_NAME.to_string());
@@ -188,8 +193,7 @@ impl Config {
             .as_ref()
             .context("config file path missing")?;
         let data = serde_json::to_vec_pretty(self).context("failed to serialize config")?;
-        fs::write(file, data)
-            .await
+        crate::secure_file::write(std::path::Path::new(file), &data)
             .with_context(|| format!("failed to write config file {file}"))?;
         Ok(())
     }
@@ -218,6 +222,7 @@ pub struct WgConf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn display_never_serializes_credentials() {
         let conf: Config = serde_json::from_value(serde_json::json!({
@@ -238,4 +243,24 @@ mod tests {
             .contains("private-key-marker"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn loading_legacy_config_migrates_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        std::fs::write(
+            &path,
+            br#"{"company_name":"test","username":"test","server":"https://example.test"}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let conf = Config::from_file(path.to_str().unwrap()).await.unwrap();
+        assert!(conf.private_key.is_some());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(Config::from_file(path.to_str().unwrap()).await.is_ok());
+    }
 }
