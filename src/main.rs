@@ -108,11 +108,7 @@ async fn run() -> Result<i32> {
     let dns_backup_filename = conf.dns_backup_filename.clone();
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let mut dns_manager = if use_vpn_dns && !netstack_mode {
-        #[cfg(target_os = "macos")]
         let mut manager = DNSManager::new(dns_backup_filename)?;
-        #[cfg(target_os = "linux")]
-        let manager = DNSManager::new(dns_backup_filename);
-        #[cfg(target_os = "macos")]
         manager.recover_dns().context("failed to recover previous DNS settings")?;
         Some(manager)
     } else {
