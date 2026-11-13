@@ -34,7 +34,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: CyanTachyon/corplink-rs
-          ref: 9923a3471956941882738a693b08a6a2f6b31520
+          ref: 5809cccfd4c49c54e76089037bcc08caeed63d29
           path: pr113
           persist-credentials: false
           submodules: recursive
@@ -102,7 +102,7 @@ jobs:
       - name: test PR 113
         working-directory: pr113
         run: cargo test --locked
-      - name: test root preservation of user-owned config (Unix)
+      - name: test root preservation of config and cookie ownership (Unix)
         if: runner.os != 'Windows'
         working-directory: pr113
         shell: bash
@@ -117,14 +117,18 @@ jobs:
                       and item.get('profile', {}).get('test')
                       and item.get('executable')]
           assert len(binaries) == 1, binaries
-          name = 'config::tests::root_migration_preserves_user_owned_config'
+          names = [
+              'config::tests::root_migration_preserves_user_owned_config',
+              'client::tests::saving_shorter_cookies_truncates_the_config_relative_file',
+          ]
           listed = subprocess.check_output([binaries[0], '--list'], text=True)
-          assert name + ': test' in listed, listed
-          result = subprocess.run(['sudo', '-n', binaries[0], '--exact', name, '--nocapture'],
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-          print(result.stdout)
-          assert result.returncode == 0 and '1 passed; 0 failed' in result.stdout
-          assert 'requires root;' not in result.stdout
+          for name in names:
+              assert name + ': test' in listed, listed
+              result = subprocess.run(['sudo', '-n', binaries[0], '--exact', name, '--nocapture'],
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              print(result.stdout)
+              assert result.returncode == 0 and '1 passed; 0 failed' in result.stdout
+              assert 'requires root;' not in result.stdout
           PY
       - name: test PR 114
         working-directory: pr114
