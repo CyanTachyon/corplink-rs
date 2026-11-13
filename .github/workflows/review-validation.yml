@@ -1,0 +1,131 @@
+name: review follow-up validation
+
+on:
+  push:
+    branches: [ci/review-followup-20261113]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.26.10'
+  RUST_VERSION: '1.93.1'
+  CARGO_TARGET_DIR: ${{ github.workspace }}/review-target
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: checkout PR 110
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: CyanTachyon/corplink-rs
+          ref: d015fb3a0482e83512937ac4e800788936721251
+          path: pr110
+          persist-credentials: false
+          submodules: recursive
+      - name: checkout PR 113
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: CyanTachyon/corplink-rs
+          ref: 9923a3471956941882738a693b08a6a2f6b31520
+          path: pr113
+          persist-credentials: false
+          submodules: recursive
+      - name: checkout PR 114
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: CyanTachyon/corplink-rs
+          ref: e041c06e1b2db5f0d3fcf2ef65717656ed454785
+          path: pr114
+          persist-credentials: false
+          submodules: recursive
+      - name: setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: pr110/libwg/wireguard-go/go.sum
+      - name: setup Rust (Unix)
+        if: runner.os != 'Windows'
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal && rustup default "$RUST_VERSION"
+      - name: setup Rust (Windows GNU)
+        if: runner.os == 'Windows'
+        run: |
+          rustup toolchain install "$env:RUST_VERSION-x86_64-pc-windows-gnu" --profile minimal
+          rustup default "$env:RUST_VERSION-x86_64-pc-windows-gnu"
+      - name: build declared native dependency (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          native_sha=$(git -C pr110 rev-parse HEAD:libwg/wireguard-go)
+          for candidate in pr113 pr114; do
+            test "$(git -C "$candidate" rev-parse HEAD:libwg/wireguard-go)" = "$native_sha"
+          done
+          cd pr110/libwg/wireguard-go
+          # The baseline Makefile needs a fallback in shallow submodule clones.
+          printf 'package main\n\nconst Version = "%s"\n' "$native_sha" > version.go
+          make libwg
+          cd ../../..
+          for candidate in pr110 pr113 pr114; do
+            cp pr110/libwg/wireguard-go/libwg.a pr110/libwg/wireguard-go/libwg.h "$candidate/libwg/"
+          done
+      - name: build declared native dependency (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nativeSha = git -C pr110 rev-parse HEAD:libwg/wireguard-go
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read native gitlink' }
+          foreach ($candidate in @('pr113', 'pr114')) {
+            $candidateSha = git -C $candidate rev-parse HEAD:libwg/wireguard-go
+            if ($LASTEXITCODE -ne 0 -or $candidateSha -ne $nativeSha) { throw 'Native gitlinks differ' }
+          }
+          Push-Location pr110/libwg/wireguard-go
+          try {
+            "package main`n`nconst Version = `"$nativeSha`"`n" | Set-Content version.go
+            make libwg
+            if ($LASTEXITCODE -ne 0) { throw 'Native build failed' }
+          } finally { Pop-Location }
+          foreach ($candidate in @('pr110', 'pr113', 'pr114')) {
+            Copy-Item pr110/libwg/wireguard-go/libwg.a,pr110/libwg/wireguard-go/libwg.h "$candidate/libwg/" -Force
+          }
+      - name: test PR 110
+        working-directory: pr110
+        run: cargo test --locked
+      - name: test PR 113
+        working-directory: pr113
+        run: cargo test --locked
+      - name: test root preservation of user-owned config (Unix)
+        if: runner.os != 'Windows'
+        working-directory: pr113
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --no-run --message-format=json > test-artifacts.json
+          python3 - <<'PY'
+          import json, subprocess
+          artifacts = [json.loads(line) for line in open('test-artifacts.json')]
+          binaries = [item['executable'] for item in artifacts
+                      if item.get('reason') == 'compiler-artifact'
+                      and item.get('profile', {}).get('test')
+                      and item.get('executable')]
+          assert len(binaries) == 1, binaries
+          name = 'config::tests::root_migration_preserves_user_owned_config'
+          listed = subprocess.check_output([binaries[0], '--list'], text=True)
+          assert name + ': test' in listed, listed
+          result = subprocess.run(['sudo', '-n', binaries[0], '--exact', name, '--nocapture'],
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          print(result.stdout)
+          assert result.returncode == 0 and '1 passed; 0 failed' in result.stdout
+          assert 'requires root;' not in result.stdout
+          PY
+      - name: test PR 114
+        working-directory: pr114
+        run: cargo test --locked
